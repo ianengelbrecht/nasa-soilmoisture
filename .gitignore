@@ -23,3 +23,6 @@ appeears_submission.json
 
 # videos
 *.mp4
+
+# datasets
+downloads/

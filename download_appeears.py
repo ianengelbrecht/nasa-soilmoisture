@@ -28,10 +28,22 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import requests
 from dotenv import load_dotenv
+
+import warnings
+# Suppress deprecation warnings from rasterio/numpy 2.5 shape assignment
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+import io
+import numpy as np
+import matplotlib
+# Use non-interactive Agg backend for script execution
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import rasterio
+from PIL import Image
 
 
 API_URL = "https://appeears.earthdatacloud.nasa.gov/api"
@@ -111,6 +123,31 @@ def parse_arguments() -> argparse.Namespace:
             "filenames directly) or 'csv' (use statistics CSV with "
             "filename translation). Default is 'bundle'."
         ),
+    )
+
+    parser.add_argument(
+        "--no-jpegs",
+        action="store_true",
+        help="Disable generating JPEG visualizations alongside the GeoTIFFs.",
+    )
+
+    parser.add_argument(
+        "--colormap",
+        default="YlGnBu",
+        help="Matplotlib colormap to use for JPEGs (default: YlGnBu)",
+    )
+
+    parser.add_argument(
+        "--geojson",
+        default="namibia.geojson",
+        help="Path to region boundary GeoJSON for JPEGs (default: namibia.geojson)",
+    )
+
+    parser.add_argument(
+        "--max-moisture",
+        type=float,
+        default=0.4,
+        help="Maximum soil moisture value for the colormap scale (default: 0.4)",
     )
 
     return parser.parse_args()
@@ -569,6 +606,146 @@ def make_output_tiff_name(
     )
 
 
+def plot_geojson(ax, geojson_path: Path, color: str = '#ffffff', linewidth: float = 1.0, alpha: float = 0.5):
+    """
+    Parse and plot features from a GeoJSON file onto a matplotlib axis.
+    Does not require geopandas or shapely.
+    """
+    if not geojson_path.exists():
+        return
+        
+    try:
+        with open(geojson_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            
+        for feature in data.get('features', []):
+            geom = feature.get('geometry', {})
+            geom_type = geom.get('type')
+            coords = geom.get('coordinates', [])
+            
+            if geom_type == 'Polygon':
+                for ring in coords:
+                    x, y = zip(*ring)
+                    ax.plot(x, y, color=color, linewidth=linewidth, alpha=alpha)
+            elif geom_type == 'MultiPolygon':
+                for polygon in coords:
+                    for ring in polygon:
+                        x, y = zip(*ring)
+                        ax.plot(x, y, color=color, linewidth=linewidth, alpha=alpha)
+    except Exception as e:
+        print(f"Warning: Could not plot GeoJSON boundary: {e}")
+
+
+def save_jpeg_frame(
+    file_path: Path,
+    output_path: Path,
+    date: datetime,
+    vmin: float,
+    vmax: float,
+    colormap: str,
+    geojson_path: Optional[Path] = None
+) -> None:
+    """
+    Render a single map frame using Matplotlib and save it as a JPEG image.
+    """
+    with rasterio.open(file_path) as src:
+        data = src.read(1).astype(np.float32)
+        nodata = src.nodata
+        
+        # Mask nodata and values outside physical limits [0, 1]
+        if nodata is not None:
+            data = np.where(data == nodata, np.nan, data)
+        data = np.where((data < 0.0) | (data > 1.0), np.nan, data)
+        
+        # Get bounding box of the raster in CRS coords
+        left, bottom, right, top = src.bounds
+        extent = [left, right, bottom, top]
+
+    # Create dark-themed visualization
+    fig, ax = plt.subplots(figsize=(10, 8), dpi=150, facecolor='#121212')
+    ax.set_facecolor('#1c1c1c')
+    
+    # Hide axis ticks but leave room for labels/layout
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+        
+    # Render the soil moisture raster
+    # Use standard interpolation for smooth visual transition
+    im = ax.imshow(
+        data,
+        extent=extent,
+        cmap=colormap,
+        vmin=vmin,
+        vmax=vmax,
+        origin='upper',
+        interpolation='nearest'
+    )
+    
+    # Plot boundary if available
+    if geojson_path:
+        plot_geojson(ax, geojson_path, color='#ffffff', linewidth=1.2, alpha=0.6)
+        
+    # Standard geographic grid lines (faint)
+    ax.grid(True, color='#ffffff', alpha=0.08, linestyle='--')
+    
+    # Set coordinates extent slightly padded
+    pad_x = (right - left) * 0.05
+    pad_y = (top - bottom) * 0.05
+    ax.set_xlim(left - pad_x, right + pad_x)
+    ax.set_ylim(bottom - pad_y, top + pad_y)
+    
+    # Add title and text overlays
+    ax.text(
+        0.02, 0.95,
+        "NASA SMAP Surface Soil Moisture",
+        transform=ax.transAxes,
+        color='#e0e0e0',
+        fontsize=14,
+        fontweight='bold',
+        va='top'
+    )
+    
+    ax.text(
+        0.02, 0.90,
+        "Namibia Region",
+        transform=ax.transAxes,
+        color='#888888',
+        fontsize=10,
+        va='top'
+    )
+    
+    formatted_date = date.strftime('%B %d, %Y')
+    ax.text(
+        0.02, 0.05,
+        formatted_date,
+        transform=ax.transAxes,
+        color='#ffffff',
+        fontsize=18,
+        fontweight='bold',
+        va='bottom'
+    )
+    
+    # Add Colorbar (horizontal or vertical, let's do a thin right-aligned vertical bar)
+    cbar = fig.colorbar(im, ax=ax, shrink=0.5, pad=0.04, aspect=25)
+    cbar.set_label(
+        'Volumetric Soil Moisture ($m^3/m^3$)',
+        color='#e0e0e0',
+        fontsize=9,
+        labelpad=10
+    )
+    cbar.ax.yaxis.set_tick_params(color='#e0e0e0', labelcolor='#e0e0e0', labelsize=8)
+    cbar.outline.set_edgecolor('#333333')
+    
+    plt.tight_layout()
+    
+    # Save directly to output path as JPEG
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_path, format='jpeg', bbox_inches='tight', dpi=150, facecolor=fig.get_facecolor(), edgecolor='none')
+    plt.close(fig)
+
+
 def main() -> int:
     args = parse_arguments()
     load_dotenv()
@@ -692,6 +869,15 @@ def main() -> int:
 
             print()
 
+            # Determine if JPEGs should be generated and load GeoJSON boundary if needed
+            if not args.no_jpegs:
+                geojson_path = Path(args.geojson)
+                if not geojson_path.exists():
+                    print(f"Warning: GeoJSON boundary '{args.geojson}' not found. JPEGs will be drawn without boundary outline.")
+                    geojson_path = None
+            else:
+                geojson_path = None
+
             for record in selected_records:
                 tiff_file = find_matching_tiff(
                     bundle_files,
@@ -711,6 +897,25 @@ def main() -> int:
                     destination=destination,
                     overwrite=args.overwrite,
                 )
+
+                if not args.no_jpegs:
+                    jpeg_destination = output_directory / "images" / destination.with_suffix(".jpg").name
+                    if not jpeg_destination.exists() or args.overwrite:
+                        print(f"Generating JPEG: {jpeg_destination.name}")
+                        try:
+                            save_jpeg_frame(
+                                file_path=destination,
+                                output_path=jpeg_destination,
+                                date=record.observed_at,
+                                vmin=0.0,
+                                vmax=args.max_moisture,
+                                colormap=args.colormap,
+                                geojson_path=geojson_path
+                            )
+                        except Exception as exc:
+                            print(f"Warning: Could not generate JPEG for {destination.name}: {exc}", file=sys.stderr)
+                    else:
+                        print(f"JPEG already exists, skipping: {jpeg_destination.name}")
 
         print("\nDownload complete.")
         print(f"Output directory: {output_directory}")
